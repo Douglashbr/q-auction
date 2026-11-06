@@ -1,0 +1,4 @@
+# Donos do código: revisores solicitados automaticamente em todo pull request.
+# A última regra que casar com o arquivo vence. Para dar dono a um serviço específico:
+#   /services/<svc>/  @usuario-ou-@org/time
+*  @Douglashbr
