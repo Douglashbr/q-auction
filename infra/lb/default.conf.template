@@ -1,0 +1,46 @@
+# Template de load balancer reutilizado por todos os serviços.
+# A imagem do nginx roda envsubst em /etc/nginx/templates/*.template na inicialização,
+# trocando ${UPSTREAM} pelo valor do environment (ex.: user-service:3000).
+# Só variáveis definidas no environment são substituídas; as do nginx ($remote_addr...) ficam intactas.
+
+# $upstream_addr mostra qual instância atendeu cada requisição.
+log_format upstreamlog '$remote_addr [$time_local] "$request" $status '
+                       'upstream=$upstream_addr rt=$request_time id=$http_x_request_id';
+
+# DNS interno do Docker.
+resolver 127.0.0.11 valid=10s;
+
+# O nome do serviço resolve para o IP de cada réplica. Sem diretiva de balanceamento
+# (least_conn, ip_hash, hash...), o nginx usa round robin, que é o padrão.
+# "resolve" (+ zone) reconsulta o DNS a cada 10s: réplicas novas/removidas entram sem restart.
+upstream backend {
+  zone backend 64k;
+  server ${UPSTREAM} resolve max_fails=1 fail_timeout=10s;
+  keepalive 32;
+}
+
+server {
+  listen 80;
+  access_log /dev/stdout upstreamlog;
+
+  # Healthcheck do próprio LB (não passa pelas instâncias).
+  location = /lb-health {
+    access_log off;
+    return 200 "ok\n";
+  }
+
+  location / {
+    proxy_pass http://backend;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Request-Id $http_x_request_id;
+
+    # Se uma instância estiver fora, tenta a próxima.
+    proxy_next_upstream error timeout http_502 http_503;
+    proxy_connect_timeout 2s;
+  }
+}

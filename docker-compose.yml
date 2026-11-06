@@ -1,0 +1,151 @@
+name: q-auction
+
+services:
+  # API Gateway (NestJS): porta de entrada única, uma instância.
+  # Encaminha /api/<serviço>/* para o load balancer de cada serviço.
+  api-gateway:
+    build: ./gateway
+    ports:
+      - "${GATEWAY_PORT:-80}:3000"
+    environment:
+      PORT: 3000
+      REDIS_URL: redis://redis:6379
+      ROUTES_USER: http://user-lb
+    networks:
+      - services
+      - data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------- user ----------
+  # Load balancer do serviço de usuários (round robin entre as réplicas).
+  user-lb:
+    image: nginx:1.27-alpine
+    environment:
+      UPSTREAM: user-service:3000
+    volumes:
+      - ./infra/lb:/etc/nginx/templates:ro
+    networks:
+      - services
+      - user
+    depends_on:
+      user-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/lb-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Serviço de usuários (Go + Fiber). Sem portas publicadas: só o user-lb acessa.
+  user-service:
+    build: ./services/user
+    deploy:
+      replicas: ${USER_REPLICAS:-2}
+    environment:
+      PORT: 3000
+    networks:
+      - user
+    healthcheck:
+      # 127.0.0.1 e não localhost: o Fiber escuta em IPv4 e no alpine localhost resolve para ::1 primeiro.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------- dados ----------
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Lidas pelo script de init para criar os usuários por serviço.
+      AUCTION_DB_PASSWORD: ${AUCTION_DB_PASSWORD}
+      BIDDING_DB_PASSWORD: ${BIDDING_DB_PASSWORD}
+      USER_DB_PASSWORD: ${USER_DB_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Cache. AOF ligado e política LRU quando atingir o limite de memória.
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Event store. Modo inseguro (sem TLS/autenticação) apenas para desenvolvimento.
+  kurrentdb:
+    image: docker.kurrent.io/kurrent-lts/kurrentdb:26.0
+    environment:
+      KURRENTDB_INSECURE: "true"
+      KURRENTDB_RUN_PROJECTIONS: All
+      KURRENTDB_START_STANDARD_PROJECTIONS: "true"
+      KURRENTDB_ENABLE_ATOM_PUB_OVER_HTTP: "true"
+    ports:
+      - "${KURRENTDB_PORT:-2113}:2113"
+    volumes:
+      - kurrent-data:/var/lib/kurrentdb
+      - kurrent-logs:/var/log/kurrentdb
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:2113/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+# services: gateway <-> load balancers dos serviços
+# user:     user-lb <-> instâncias do user-service (o gateway não fala direto com elas)
+# data:     quem precisa de banco/cache <-> postgres, redis, kurrentdb
+networks:
+  services:
+  user:
+  data:
+
+volumes:
+  pg-data:
+  redis-data:
+  kurrent-data:
+  kurrent-logs:
